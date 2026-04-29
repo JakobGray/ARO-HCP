@@ -430,6 +430,12 @@ func (b *Backend) runBackendControllersUnderLeaderElection(ctx context.Context, 
 		activeOperationLister,
 		backendInformers,
 	)
+	clusterServiceCreateClusterController := createcontrollers.NewClusterServiceCreateClusterController(
+		b.options.CosmosDBClient,
+		b.options.ClustersServiceClient,
+		activeOperationLister,
+		backendInformers,
+	)
 	clusterPropertiesSyncController := clusterpropertiescontroller.NewClusterPropertiesSyncController(
 		b.options.CosmosDBClient,
 		b.options.ClustersServiceClient,
@@ -568,6 +574,7 @@ func (b *Backend) runBackendControllersUnderLeaderElection(ctx context.Context, 
 				go controlPlaneActiveVersionController.Run(ctx, 20)
 				go controlPlaneDesiredVersionController.Run(ctx, 20)
 				go triggerControlPlaneUpgradeController.Run(ctx, 20)
+				go clusterServiceCreateClusterController.Run(ctx, 20)
 				go clusterPropertiesSyncController.Run(ctx, 20)
 				go clusterServiceMigrationController.Run(ctx, 20)
 				go identityMigrationController.Run(ctx, 20)
