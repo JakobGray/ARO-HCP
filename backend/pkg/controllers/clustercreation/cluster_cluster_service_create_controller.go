@@ -76,6 +76,7 @@ func (c *clusterClusterServiceCreateSyncer) needsWork(cluster *api.HCPOpenShiftC
 func (c *clusterClusterServiceCreateSyncer) SyncOnce(ctx context.Context, key controllerutils.HCPClusterKey) error {
 	logger := utils.LoggerFromContext(ctx)
 
+	// Quick cache lookup first to see if work is needed
 	cluster, err := c.clusterLister.Get(ctx, key.SubscriptionID, key.ResourceGroupName, key.HCPClusterName)
 	if database.IsNotFoundError(err) {
 		return nil
@@ -88,6 +89,7 @@ func (c *clusterClusterServiceCreateSyncer) SyncOnce(ctx context.Context, key co
 		return nil
 	}
 
+	// Confirm against the live document to make sure the cluster hasn't been deleted or modified since we last checked
 	cluster, err = c.resourcesDBClient.HCPClusters(key.SubscriptionID, key.ResourceGroupName).Get(ctx, key.HCPClusterName)
 	if database.IsNotFoundError(err) {
 		return nil
@@ -146,8 +148,11 @@ func (c *clusterClusterServiceCreateSyncer) SyncOnce(ctx context.Context, key co
 	logger.Info("Storing ClusterServiceID on cluster document", "clusterServiceID", csInternalID.String())
 	cluster.ServiceProviderProperties.ClusterServiceID = &csInternalID
 	_, err = c.resourcesDBClient.HCPClusters(key.SubscriptionID, key.ResourceGroupName).Replace(ctx, cluster, nil)
+	if database.IsPreconditionFailedError(err) {
+		return nil
+	}
 	if err != nil {
-		return utils.TrackError(err)
+		return utils.TrackError(fmt.Errorf("failed to replace Cluster: %w", err))
 	}
 
 	return nil
@@ -157,10 +162,12 @@ func (c *clusterClusterServiceCreateSyncer) SyncOnce(ctx context.Context, key co
 // controller has written the Cincinnati-resolved desired version to the ServiceProviderCluster.
 // Returns (false, nil) when this controller should wait and retry.
 func (c *clusterClusterServiceCreateSyncer) createPreconditionDesiredVersionResolved(ctx context.Context, serviceProviderCluster *api.ServiceProviderCluster) (bool, error) {
+	logger := utils.LoggerFromContext(ctx)
+
 	if serviceProviderCluster.Spec.ControlPlaneVersion.DesiredVersion != nil {
 		return true, nil
 	}
-	utils.LoggerFromContext(ctx).Info("DesiredVersion not yet set, waiting for ControlPlaneDesiredVersion controller")
+	logger.Info("DesiredVersion not yet set, waiting for ControlPlaneDesiredVersion controller")
 	return false, nil
 }
 

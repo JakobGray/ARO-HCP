@@ -69,7 +69,10 @@ func testClusterResourceID() *azcorearm.ResourceID {
 func newTestCluster(opts ...func(*api.HCPOpenShiftCluster)) *api.HCPOpenShiftCluster {
 	rid := testClusterResourceID()
 	cluster := api.MinimumValidClusterTestCase()
-	cluster.CosmosMetadata = arm.CosmosMetadata{ResourceID: rid}
+	cluster.CosmosMetadata = arm.CosmosMetadata{
+		ResourceID:   rid,
+		PartitionKey: strings.ToLower(rid.SubscriptionID),
+	}
 	cluster.ID = rid
 	cluster.Name = testClusterName
 	cluster.Type = rid.ResourceType.String()
@@ -85,30 +88,32 @@ func newTestCluster(opts ...func(*api.HCPOpenShiftCluster)) *api.HCPOpenShiftClu
 func newTestSubscription() *arm.Subscription {
 	rid := api.Must(azcorearm.ParseResourceID("/subscriptions/" + testSubscriptionID))
 	return &arm.Subscription{
-		CosmosMetadata: api.CosmosMetadata{ResourceID: rid},
-		ResourceID:     rid,
-		Properties:     &arm.SubscriptionProperties{TenantId: ptr.To(testTenantID)},
+		CosmosMetadata: api.CosmosMetadata{
+			ResourceID:   rid,
+			PartitionKey: strings.ToLower(rid.SubscriptionID),
+		},
+		ResourceID: rid,
+		Properties: &arm.SubscriptionProperties{TenantId: ptr.To(testTenantID)},
 	}
 }
 
-// addTestServiceProviderCluster inserts a ServiceProviderCluster document with
-// the given desiredVersion into the mock DB.
-func addTestServiceProviderCluster(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient, desiredVersion *semver.Version) {
-	t.Helper()
+// newTestSPC returns a ServiceProviderCluster for the test cluster.
+// Callers can customize it via functional opts.
+func newTestSPC(opts ...func(*api.ServiceProviderCluster)) *api.ServiceProviderCluster {
 	resourceID := api.Must(azcorearm.ParseResourceID(fmt.Sprintf("%s/%s/%s",
 		testClusterResourceID().String(),
 		api.ServiceProviderClusterResourceTypeName,
 		api.ServiceProviderClusterResourceName,
 	)))
-	_, err := db.ServiceProviderClusters(testSubscriptionID, testResourceGroupName, testClusterName).Create(ctx, &api.ServiceProviderCluster{
+	spc := &api.ServiceProviderCluster{
 		CosmosMetadata: api.CosmosMetadata{ResourceID: resourceID},
-		Spec: api.ServiceProviderClusterSpec{
-			ControlPlaneVersion: api.ServiceProviderClusterSpecVersion{
-				DesiredVersion: desiredVersion,
-			},
-		},
-	}, nil)
-	require.NoError(t, err)
+		Spec:           api.ServiceProviderClusterSpec{},
+	}
+	spc.SetPartitionKey(testSubscriptionID)
+	for _, opt := range opts {
+		opt(spc)
+	}
+	return spc
 }
 
 func TestClusterClusterServiceCreate_SyncOnce(t *testing.T) {
@@ -116,19 +121,21 @@ func TestClusterClusterServiceCreate_SyncOnce(t *testing.T) {
 	clusterInternalID := api.Must(api.NewInternalID(testClusterServiceIDStr))
 
 	tests := []struct {
-		name           string
-		listCluster    *api.HCPOpenShiftCluster // cluster seeded into the lister (nil = not found)
-		dbCluster      *api.HCPOpenShiftCluster // cluster stored in the DB
-		desiredVersion *semver.Version          // nil = no ServiceProviderCluster desiredVersion set
-		setupMockCS    func(ctrl *gomock.Controller) ocm.ClusterServiceClientSpec
-		expectError    bool
-		verify         func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient)
+		name                           string
+		listCluster                    *api.HCPOpenShiftCluster    // cluster seeded into the lister (nil = not found)
+		dbCluster                      *api.HCPOpenShiftCluster    // cluster stored in the DB
+		existingServiceProviderCluster *api.ServiceProviderCluster // nil = not pre-seeded; controller get-or-creates
+		setupMockCS                    func(ctrl *gomock.Controller) ocm.ClusterServiceClientSpec
+		expectError                    bool
+		verifyDB                       func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient)
 	}{
 		{
-			name:           "successful sync records cluster service ID on cluster",
-			listCluster:    newTestCluster(),
-			dbCluster:      newTestCluster(),
-			desiredVersion: desiredVersion,
+			name:        "successful sync records cluster service ID on cluster",
+			listCluster: newTestCluster(),
+			dbCluster:   newTestCluster(),
+			existingServiceProviderCluster: newTestSPC(func(spc *api.ServiceProviderCluster) {
+				spc.Spec.ControlPlaneVersion.DesiredVersion = desiredVersion
+			}),
 			setupMockCS: func(ctrl *gomock.Controller) ocm.ClusterServiceClientSpec {
 				mockCS := ocm.NewMockClusterServiceClientSpec(ctrl)
 				mockCS.EXPECT().
@@ -144,7 +151,7 @@ func TestClusterClusterServiceCreate_SyncOnce(t *testing.T) {
 				return mockCS
 			},
 			expectError: false,
-			verify: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
+			verifyDB: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
 				cluster, err := db.HCPClusters(testSubscriptionID, testResourceGroupName).Get(ctx, testClusterName)
 				require.NoError(t, err)
 				require.NotNil(t, cluster.ServiceProviderProperties.ClusterServiceID)
@@ -163,7 +170,7 @@ func TestClusterClusterServiceCreate_SyncOnce(t *testing.T) {
 				return ocm.NewMockClusterServiceClientSpec(ctrl)
 			},
 			expectError: false,
-			verify: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
+			verifyDB: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
 				cluster, err := db.HCPClusters(testSubscriptionID, testResourceGroupName).Get(ctx, testClusterName)
 				require.NoError(t, err)
 				require.NotNil(t, cluster.ServiceProviderProperties.ClusterServiceID)
@@ -178,17 +185,19 @@ func TestClusterClusterServiceCreate_SyncOnce(t *testing.T) {
 				return ocm.NewMockClusterServiceClientSpec(ctrl)
 			},
 			expectError: false,
-			verify: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
+			verifyDB: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
 				cluster, err := db.HCPClusters(testSubscriptionID, testResourceGroupName).Get(ctx, testClusterName)
 				require.NoError(t, err)
 				assert.Nil(t, cluster.ServiceProviderProperties.ClusterServiceID)
 			},
 		},
 		{
-			name:           "adopts existing Cluster Service cluster for Azure resource",
-			listCluster:    newTestCluster(),
-			dbCluster:      newTestCluster(),
-			desiredVersion: desiredVersion,
+			name:        "adopts existing Cluster Service cluster for Azure resource",
+			listCluster: newTestCluster(),
+			dbCluster:   newTestCluster(),
+			existingServiceProviderCluster: newTestSPC(func(spc *api.ServiceProviderCluster) {
+				spc.Spec.ControlPlaneVersion.DesiredVersion = desiredVersion
+			}),
 			setupMockCS: func(ctrl *gomock.Controller) ocm.ClusterServiceClientSpec {
 				mockCS := ocm.NewMockClusterServiceClientSpec(ctrl)
 				// Build the CS cluster with Azure fields matching the test cluster so it
@@ -209,7 +218,7 @@ func TestClusterClusterServiceCreate_SyncOnce(t *testing.T) {
 				return mockCS
 			},
 			expectError: false,
-			verify: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
+			verifyDB: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
 				cluster, err := db.HCPClusters(testSubscriptionID, testResourceGroupName).Get(ctx, testClusterName)
 				require.NoError(t, err)
 				require.NotNil(t, cluster.ServiceProviderProperties.ClusterServiceID)
@@ -223,14 +232,14 @@ func TestClusterClusterServiceCreate_SyncOnce(t *testing.T) {
 			ctx := context.Background()
 			ctx = utils.ContextWithLogger(ctx, testr.New(t))
 			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
 
 			subscription := newTestSubscription()
 			mockDB, err := databasetesting.NewMockResourcesDBClientWithResources(ctx, []any{subscription, tt.dbCluster})
 			require.NoError(t, err)
 
-			if tt.desiredVersion != nil {
-				addTestServiceProviderCluster(t, ctx, mockDB, tt.desiredVersion)
+			if tt.existingServiceProviderCluster != nil {
+				_, err := mockDB.ServiceProviderClusters(testSubscriptionID, testResourceGroupName, testClusterName).Create(ctx, tt.existingServiceProviderCluster, nil)
+				require.NoError(t, err)
 			}
 
 			mockCS := tt.setupMockCS(ctrl)
@@ -259,8 +268,8 @@ func TestClusterClusterServiceCreate_SyncOnce(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			if tt.verify != nil {
-				tt.verify(t, ctx, mockDB)
+			if tt.verifyDB != nil {
+				tt.verifyDB(t, ctx, mockDB)
 			}
 		})
 	}
@@ -293,47 +302,69 @@ func TestClusterClusterServiceCreate_findAROHCPClusterByAzureInfo(t *testing.T) 
 		" and azure.tenant_id = '" + tenant + "'" +
 		" and azure.managed_resource_group_name = '" + mrg + "'"
 
-	t.Run("found on primary search", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
-		match := azureTestCluster(t, strings.ToLower(sub), strings.ToLower(rg), strings.ToLower(resName), tenant, mrg)
-		mock := ocm.NewMockClusterServiceClientSpec(ctrl)
-		mock.EXPECT().
-			ListClusters(wantSearch).
-			Return(ocm.NewSimpleClusterListIterator([]*arohcpv1alpha1.Cluster{match}, nil))
+	wantSub := strings.ToLower(sub)
+	wantRG := strings.ToLower(rg)
+	wantName := strings.ToLower(resName)
 
-		s := &clusterClusterServiceCreateSyncer{clustersServiceClient: mock}
-		got, err := s.findAROHCPClusterByAzureInfo(ctx, sub, rg, resName, tenant, mrg)
-		require.NoError(t, err)
-		require.Same(t, match, got)
-	})
+	tests := []struct {
+		name        string
+		setupMockCS func(t *testing.T, ctrl *gomock.Controller) (ocm.ClusterServiceClientSpec, *arohcpv1alpha1.Cluster)
+		wantErr     bool
+	}{
+		{
+			name: "found on primary search",
+			setupMockCS: func(t *testing.T, ctrl *gomock.Controller) (ocm.ClusterServiceClientSpec, *arohcpv1alpha1.Cluster) {
+				match := azureTestCluster(t, wantSub, wantRG, wantName, tenant, mrg)
+				mock := ocm.NewMockClusterServiceClientSpec(ctrl)
+				mock.EXPECT().
+					ListClusters(wantSearch).
+					Return(ocm.NewSimpleClusterListIterator([]*arohcpv1alpha1.Cluster{match}, nil))
+				return mock, match
+			},
+		},
+		{
+			name: "not found",
+			setupMockCS: func(t *testing.T, ctrl *gomock.Controller) (ocm.ClusterServiceClientSpec, *arohcpv1alpha1.Cluster) {
+				mock := ocm.NewMockClusterServiceClientSpec(ctrl)
+				mock.EXPECT().
+					ListClusters(wantSearch).
+					Return(ocm.NewSimpleClusterListIterator(nil, nil))
+				return mock, nil
+			},
+		},
+		{
+			name: "multiple matches error",
+			setupMockCS: func(t *testing.T, ctrl *gomock.Controller) (ocm.ClusterServiceClientSpec, *arohcpv1alpha1.Cluster) {
+				a := azureTestCluster(t, wantSub, wantRG, wantName, tenant, mrg)
+				b := azureTestCluster(t, wantSub, wantRG, wantName, tenant, mrg)
+				mock := ocm.NewMockClusterServiceClientSpec(ctrl)
+				mock.EXPECT().
+					ListClusters(wantSearch).
+					Return(ocm.NewSimpleClusterListIterator([]*arohcpv1alpha1.Cluster{a, b}, nil))
+				return mock, nil
+			},
+			wantErr: true,
+		},
+	}
 
-	t.Run("not found", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
-		mock := ocm.NewMockClusterServiceClientSpec(ctrl)
-		mock.EXPECT().
-			ListClusters(wantSearch).
-			Return(ocm.NewSimpleClusterListIterator(nil, nil))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockCS, want := tt.setupMockCS(t, ctrl)
 
-		s := &clusterClusterServiceCreateSyncer{clustersServiceClient: mock}
-		got, err := s.findAROHCPClusterByAzureInfo(ctx, sub, rg, resName, tenant, mrg)
-		require.NoError(t, err)
-		require.Nil(t, got)
-	})
+			s := &clusterClusterServiceCreateSyncer{clustersServiceClient: mockCS}
+			got, err := s.findAROHCPClusterByAzureInfo(ctx, sub, rg, resName, tenant, mrg)
 
-	t.Run("multiple matches error", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
-		a := azureTestCluster(t, strings.ToLower(sub), strings.ToLower(rg), strings.ToLower(resName), tenant, mrg)
-		b := azureTestCluster(t, strings.ToLower(sub), strings.ToLower(rg), strings.ToLower(resName), tenant, mrg)
-		mock := ocm.NewMockClusterServiceClientSpec(ctrl)
-		mock.EXPECT().
-			ListClusters(wantSearch).
-			Return(ocm.NewSimpleClusterListIterator([]*arohcpv1alpha1.Cluster{a, b}, nil))
-
-		s := &clusterClusterServiceCreateSyncer{clustersServiceClient: mock}
-		_, err := s.findAROHCPClusterByAzureInfo(ctx, sub, rg, resName, tenant, mrg)
-		require.Error(t, err)
-	})
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			if want != nil {
+				require.Same(t, want, got)
+			} else {
+				require.Nil(t, got)
+			}
+		})
+	}
 }
