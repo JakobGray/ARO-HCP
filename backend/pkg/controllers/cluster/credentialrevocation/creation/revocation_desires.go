@@ -192,7 +192,9 @@ func (c *revocationDesires) ensureRevocationDesires(
 		return err
 	}
 	if err := kubeapplierhelpers.EnsureApplyDesire(ctx, applyCRUD, c.applyDesireLister, crrDesire); err != nil {
-		return err
+		if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+			return err
+		}
 	}
 
 	// 2. CRR ReadDesire so the CRR status is mirrored back for the completion controller.
@@ -203,7 +205,9 @@ func (c *revocationDesires) ensureRevocationDesires(
 		return err
 	}
 	if err := kubeapplierhelpers.EnsureReadDesire(ctx, readCRUD, c.readDesireLister, crrReadDesire); err != nil {
-		return err
+		if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+			return err
+		}
 	}
 
 	return nil

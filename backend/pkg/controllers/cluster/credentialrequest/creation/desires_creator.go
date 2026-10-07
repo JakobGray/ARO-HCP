@@ -202,7 +202,9 @@ func (c *desiresCreator) ensureDesires(
 		return err
 	}
 	if err := kubeapplierhelpers.EnsureApplyDesire(ctx, applyCRUD, c.applyDesireLister, csrDesire); err != nil {
-		return err
+		if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+			return err
+		}
 	}
 
 	// 2. CSRApproval ApplyDesire
@@ -221,7 +223,9 @@ func (c *desiresCreator) ensureDesires(
 		return err
 	}
 	if err := kubeapplierhelpers.EnsureApplyDesire(ctx, applyCRUD, c.applyDesireLister, csrApprovalDesire); err != nil {
-		return err
+		if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+			return err
+		}
 	}
 
 	// 3. CSR ReadDesire
@@ -238,7 +242,9 @@ func (c *desiresCreator) ensureDesires(
 		return err
 	}
 	if err := kubeapplierhelpers.EnsureReadDesire(ctx, readCRUD, c.readDesireLister, csrReadDesire); err != nil {
-		return err
+		if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+			return err
+		}
 	}
 
 	return nil

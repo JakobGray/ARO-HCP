@@ -72,7 +72,8 @@ type clusterResourcesController struct {
 	readDesireLister             kubeapplierlisters.ReadDesireLister
 
 	// resourcesFetchCooldown gates GetClusterResources on the last successful
-	// fetch and ApplyDesire update for the cluster.
+	// fetch. A lost desire write calls SkipCooldown so that success does not
+	// start the interval.
 	resourcesFetchCooldown *controllerutil.LastSuccessCooldownChecker
 }
 
@@ -168,7 +169,11 @@ func (c *clusterResourcesController) SyncOnce(ctx context.Context, key controlle
 	}
 
 	clusterServiceID := *cluster.ServiceProviderProperties.ClusterServiceID
+	// A lost desire write calls SkipCooldown so RecordSuccess below does not
+	// start the interval. Any other error clears that skip: this sync did not
+	// succeed, and the next one that does should still be able to start it.
 	if err := c.fetchAndProcessClusterResources(ctx, key, managementCluster, clusterServiceID); err != nil {
+		c.resourcesFetchCooldown.ClearSkipCooldown(key)
 		return utils.TrackError(fmt.Errorf("failed to get cluster resources: %w", err))
 	}
 	c.resourcesFetchCooldown.RecordSuccess(key)
@@ -177,28 +182,29 @@ func (c *clusterResourcesController) SyncOnce(ctx context.Context, key controlle
 }
 
 // fetchAndProcessClusterResources calls the Cluster Service SDK to get cluster resources information
-// and processes the resources.
+// and processes the resources. A lost desire write skips the resources cooldown
+// instead of failing the sync.
 func (c *clusterResourcesController) fetchAndProcessClusterResources(ctx context.Context,
 	key controllerutils.HCPClusterKey, managementCluster *azcorearm.ResourceID, clusterServiceID metadataapi.InternalID) error {
-	// Get cluster resources from the Cluster Service SDK
 	resources, err := c.clustersServiceClient.GetClusterResources(ctx, clusterServiceID)
 	if err != nil {
 		return utils.TrackError(err)
 	}
-
-	if resources != nil {
-		if err := c.processClusterResources(ctx, key, managementCluster, resources); err != nil {
-			return utils.TrackError(fmt.Errorf("failed to process cluster resources: %w", err))
-		}
+	if resources == nil {
+		return nil
 	}
 
+	if err := c.processClusterResources(ctx, key, managementCluster, resources); err != nil {
+		return utils.TrackError(fmt.Errorf("failed to process cluster resources: %w", err))
+	}
 	return nil
 }
 
-// processClusterResources converts each resource to ApplyDesire documents
+// processClusterResources writes one ApplyDesire per Cluster Service resource
+// and removes desires this controller no longer wants. A lost desire write
+// skips the resources cooldown and is not included in the returned error.
 func (c *clusterResourcesController) processClusterResources(ctx context.Context, key controllerutils.HCPClusterKey,
 	managementCluster *azcorearm.ResourceID, resources *arohcpv1alpha1.ClusterResources) error {
-
 	kubeApplierDBClient := c.kubeApplierDBClients.For(ctx, managementCluster)
 	if kubeApplierDBClient == nil {
 		return nil
@@ -313,7 +319,11 @@ func (c *clusterResourcesController) processClusterResources(ctx context.Context
 		desiredResourceIDs[strings.ToLower(desire.ResourceID.String())] = true
 
 		if err := kubeapplierhelpers.EnsureApplyDesire(ctx, crud, c.applyDesireLister, desire); err != nil {
-			errs = append(errs, err)
+			if kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+				c.resourcesFetchCooldown.SkipCooldown(key)
+			} else {
+				errs = append(errs, err)
+			}
 			continue
 		}
 
@@ -360,7 +370,11 @@ func (c *clusterResourcesController) processClusterResources(ctx context.Context
 			}
 
 			if err := kubeapplierhelpers.EnsureReadDesire(ctx, readCRUD, c.readDesireLister, readDesire); err != nil {
-				errs = append(errs, err)
+				if kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+					c.resourcesFetchCooldown.SkipCooldown(key)
+				} else {
+					errs = append(errs, err)
+				}
 			}
 		}
 	}
@@ -683,6 +697,10 @@ func shouldCreateReadDesireFor(DesireName string) bool {
 	}
 }
 
+// deleteStaleApplyDesires flips ApplyDesires owned by this controller that are
+// absent from currentDesiredResourceIDs to Type=Delete, and purges those whose
+// delete has already succeeded. A lost delete flip skips the resources cooldown
+// and is not returned as an error.
 func (c *clusterResourcesController) deleteStaleApplyDesires(
 	ctx context.Context,
 	key controllerutils.HCPClusterKey,
@@ -721,6 +739,10 @@ func (c *clusterResourcesController) deleteStaleApplyDesires(
 		}
 		removed, err := kubeapplierhelpers.EnsureApplyDesireRemoved(ctx, desire.ResourceID.Name, applyDesireCRUD)
 		if err != nil {
+			if kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+				c.resourcesFetchCooldown.SkipCooldown(key)
+				continue
+			}
 			return err
 		}
 		if removed {

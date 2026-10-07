@@ -187,7 +187,9 @@ func (c *createClusterScopedReadDesiresSyncer) SyncOnce(ctx context.Context, key
 			continue
 		}
 		if err := kubeapplierhelpers.EnsureReadDesire(ctx, crud, c.readDesireLister, readDesire); err != nil {
-			errs = append(errs, err)
+			if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)

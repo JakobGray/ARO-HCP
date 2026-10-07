@@ -231,7 +231,9 @@ func (c *keyRotationBackupSyncer) SyncOnce(ctx context.Context, key controllerut
 				return utils.TrackError(fmt.Errorf("failed to build key rotation read desire: %w", err))
 			}
 			if err := kubeapplierhelpers.EnsureReadDesire(ctx, readDesireCRUD, c.readDesireLister, desiredReadDesire); err != nil {
-				return err
+				if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+					return err
+				}
 			}
 			inFlight = true
 		}
@@ -263,11 +265,15 @@ func (c *keyRotationBackupSyncer) SyncOnce(ctx context.Context, key controllerut
 			}
 
 			if err := kubeapplierhelpers.EnsureReadDesire(ctx, readDesireCRUD, c.readDesireLister, desiredReadDesire); err != nil {
-				return err
+				if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+					return err
+				}
 			}
 
 			if err := kubeapplierhelpers.EnsureApplyDesire(ctx, applyDesireCRUD, c.applyDesireLister, desiredApplyDesire); err != nil {
-				return err
+				if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+					return err
+				}
 			}
 		}
 	}

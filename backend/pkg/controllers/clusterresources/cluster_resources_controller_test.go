@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clocktesting "k8s.io/utils/clock/testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/data/azcosmos"
 
 	arohcpv1alpha1 "github.com/openshift-online/ocm-sdk-go/arohcp/v1alpha1"
 	"github.com/openshift/hypershift/api/hypershift/v1beta1"
@@ -45,6 +48,8 @@ import (
 	"github.com/Azure/ARO-HCP/internal/apihelpers/kubeapplierapihelpers"
 	"github.com/Azure/ARO-HCP/internal/apihelpers/metadataapihelpers"
 	controllerutil "github.com/Azure/ARO-HCP/internal/controllerutils"
+	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/cosmosstorageutils"
+	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/kubeappliercosmosstorage"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstoragetesting/kubeappliercosmosstoragetesting"
 	"github.com/Azure/ARO-HCP/internal/database/listers/kubeapplierlisters"
 	"github.com/Azure/ARO-HCP/internal/database/listertesting/corelistertesting"
@@ -710,6 +715,59 @@ func TestSyncOnce_FailedApplyDesireUpdateDoesNotStartResourcesFetchInterval(t *t
 	require.NoError(t, syncer.SyncOnce(ctx, testKey()), "sync after the interval should fetch cluster resources again")
 }
 
+func TestSyncOnce_LostApplyDesireWriteDoesNotStartResourcesFetchInterval(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	ctx := utils.ContextWithLogger(context.Background(), testr.New(t))
+	ctrl := gomock.NewController(t)
+	clk := clocktesting.NewFakePassiveClock(fixedNow)
+
+	cooldown := controllerutil.NewLastSuccessCooldownChecker(resourcesFetchInterval)
+	cooldown.SetClock(clk)
+
+	configMap := `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"default-ingress","namespace":"ocm-env-abc"},"data":{"key":"value"}}`
+	resources := buildClusterResources(map[string]string{"default-ingress-configmap": configMap})
+
+	mock := ocm.NewMockClusterServiceClientSpec(ctrl)
+	gomock.InOrder(
+		mock.EXPECT().GetClusterResources(gomock.Any(), gomock.Any()).Return(resources, nil),
+		mock.EXPECT().GetClusterResources(gomock.Any(), gomock.Any()).Return(resources, nil),
+		mock.EXPECT().GetClusterResources(gomock.Any(), gomock.Any()).Return(resources, nil),
+	)
+
+	mockKubeApplierDBClients := kubeappliercosmosstoragetesting.NewMockKubeApplierDBClients()
+	mockKubeApplierClient := kubeappliercosmosstoragetesting.NewMockKubeApplierDBClient()
+	mockKubeApplierDBClients.Register(testManagementClusterResourceID, mockKubeApplierClient)
+	dbLister := &kubeapplierlistertesting.DBApplyDesireLister{
+		Clients: mockKubeApplierDBClients,
+		Lister: &fleetlistertesting.SliceManagementClusterLister{
+			ManagementClusters: []*fleetapi.ManagementCluster{
+				{CosmosMetadata: coreapi.CosmosMetadata{ResourceID: testManagementClusterResourceID}},
+			},
+		},
+	}
+
+	// Seed the ApplyDesire the sync will try to create, so a lister miss turns
+	// the create into an HTTP 409.
+	seed := newIntervalSyncer(mock, cooldown)
+	seed.kubeApplierDBClients = mockKubeApplierDBClients
+	seed.applyDesireLister = dbLister
+	err := seed.processClusterResources(ctx, testKey(), testManagementClusterResourceID, resources)
+	require.NoError(t, err, "seeding the ApplyDesire should succeed")
+
+	syncer := newIntervalSyncer(mock, cooldown)
+	syncer.kubeApplierDBClients = mockKubeApplierDBClients
+	syncer.applyDesireLister = &notFoundNApplyDesireLister{ApplyDesireLister: dbLister, missesRemaining: 1}
+
+	require.NoError(t, syncer.SyncOnce(ctx, testKey()), "a lost ApplyDesire write should not fail the sync")
+	require.NoError(t, syncer.SyncOnce(ctx, testKey()), "retry after a lost write should call Cluster Service again")
+	require.NoError(t, syncer.SyncOnce(ctx, testKey()), "sync inside the interval after success should skip Cluster Service")
+
+	clk.SetTime(fixedNow.Add(resourcesFetchInterval + time.Nanosecond))
+	require.NoError(t, syncer.SyncOnce(ctx, testKey()), "sync after the interval should fetch cluster resources again")
+}
+
 func newIntervalSyncer(csClient ocm.ClusterServiceClientSpec, cooldown *controllerutil.LastSuccessCooldownChecker) *clusterResourcesController {
 	return &clusterResourcesController{
 		clusterLister: &corelistertesting.SliceClusterLister{
@@ -734,6 +792,21 @@ func (l *failNApplyDesireLister) GetByResourceID(ctx context.Context, resourceID
 	if l.failsRemaining > 0 {
 		l.failsRemaining--
 		return nil, fmt.Errorf("apply desire lister unavailable")
+	}
+	return l.ApplyDesireLister.GetByResourceID(ctx, resourceID)
+}
+
+// notFoundNApplyDesireLister reports the desire missing for the first
+// missesRemaining lookups, so EnsureApplyDesire attempts a create.
+type notFoundNApplyDesireLister struct {
+	kubeapplierlisters.ApplyDesireLister
+	missesRemaining int
+}
+
+func (l *notFoundNApplyDesireLister) GetByResourceID(ctx context.Context, resourceID string) (*kubeapplierapi.ApplyDesire, error) {
+	if l.missesRemaining > 0 {
+		l.missesRemaining--
+		return nil, cosmosstorageutils.NewNotFoundError()
 	}
 	return l.ApplyDesireLister.GetByResourceID(ctx, resourceID)
 }
@@ -792,10 +865,12 @@ func TestDeleteStaleApplyDesires(t *testing.T) {
 				},
 			},
 		}
+		cooldown := controllerutil.NewLastSuccessCooldownChecker(resourcesFetchInterval)
 		syncer := &clusterResourcesController{
-			kubeApplierDBClients: mockClients,
-			applyDesireLister:    &kubeapplierlistertesting.DBApplyDesireLister{Clients: mockClients, Lister: mcLister},
-			readDesireLister:     &kubeapplierlistertesting.DBReadDesireLister{Clients: mockClients, Lister: mcLister},
+			kubeApplierDBClients:   mockClients,
+			applyDesireLister:      &kubeapplierlistertesting.DBApplyDesireLister{Clients: mockClients, Lister: mcLister},
+			readDesireLister:       &kubeapplierlistertesting.DBReadDesireLister{Clients: mockClients, Lister: mcLister},
+			resourcesFetchCooldown: cooldown,
 		}
 
 		currentResourceID := kubeapplierapihelpers.ToClusterScopedApplyDesireResourceIDString(
@@ -804,6 +879,8 @@ func TestDeleteStaleApplyDesires(t *testing.T) {
 		err := syncer.deleteStaleApplyDesires(ctx, testKey(), testManagementClusterResourceID,
 			map[string]bool{currentResourceID: true})
 		require.NoError(t, err, "deleteStaleApplyDesires should succeed")
+		cooldown.RecordSuccess(testKey())
+		assert.False(t, cooldown.CanSync(ctx, testKey()), "a completed stale cleanup should let the resources cooldown start")
 
 		stale, err := crud.Get(ctx, "configmaps.ns.stale")
 		require.NoError(t, err, "stale desire should still exist")
@@ -924,6 +1001,43 @@ func TestDeleteStaleApplyDesires(t *testing.T) {
 
 		_, err = crud.Get(ctx, "configmaps.ns.gone")
 		assert.Error(t, err, "purged ApplyDesire should no longer exist")
+	})
+
+	t.Run("skips the resources cooldown when the delete flip loses its etag check", func(t *testing.T) {
+		t.Parallel()
+		ctx := utils.ContextWithLogger(context.Background(), testr.New(t))
+
+		mockKubeApplierClient := kubeappliercosmosstoragetesting.NewMockKubeApplierDBClient()
+		mockClients := kubeappliercosmosstoragetesting.NewMockKubeApplierDBClients()
+		mockClients.Register(testManagementClusterResourceID, mockKubeApplierClient)
+
+		crud, err := mockKubeApplierClient.ApplyDesiresForCluster(testSubscriptionID, testResourceGroupName, testClusterName)
+		require.NoError(t, err, "failed to get cluster ApplyDesires CRUD")
+		_, err = crud.Create(ctx, makeTaggedDesire("configmaps.ns.stale"), nil)
+		require.NoError(t, err, "failed to seed the stale ApplyDesire")
+
+		mcLister := &fleetlistertesting.SliceManagementClusterLister{
+			ManagementClusters: []*fleetapi.ManagementCluster{
+				{CosmosMetadata: coreapi.CosmosMetadata{ResourceID: testManagementClusterResourceID}},
+			},
+		}
+		cooldown := controllerutil.NewLastSuccessCooldownChecker(resourcesFetchInterval)
+		syncer := &clusterResourcesController{
+			kubeApplierDBClients: fixedKubeApplierDBClients{
+				client: preconditionOnReplaceClient{KubeApplierDBClient: mockKubeApplierClient},
+			},
+			applyDesireLister:      &kubeapplierlistertesting.DBApplyDesireLister{Clients: mockClients, Lister: mcLister},
+			resourcesFetchCooldown: cooldown,
+		}
+
+		err = syncer.deleteStaleApplyDesires(ctx, testKey(), testManagementClusterResourceID, map[string]bool{})
+		require.NoError(t, err, "a lost etag check should not fail stale cleanup")
+		cooldown.RecordSuccess(testKey())
+		assert.True(t, cooldown.CanSync(ctx, testKey()), "a lost etag check should skip the resources cooldown")
+
+		stale, err := crud.Get(ctx, "configmaps.ns.stale")
+		require.NoError(t, err, "the desire should remain after the lost replace")
+		assert.Equal(t, kubeapplierapi.ApplyDesireTypeServerSideApply, stale.Spec.Type, "the delete flip should not have been stored")
 	})
 }
 
@@ -1164,17 +1278,17 @@ func TestProcessClusterResourcesNodePoolPath(t *testing.T) {
 			seedSyncer.nodePoolLister = &corelistertesting.SliceNodePoolLister{
 				NodePools: []*coreapi.NodePool{newNodePool(false)},
 			}
-			require.NoError(t, seedSyncer.processClusterResources(ctx, testKey(), testManagementClusterResourceID,
-				buildClusterResources(map[string]string{"node-pool": nodePoolCR})),
-				"seeding the NodePool ApplyDesire should succeed")
+			err = seedSyncer.processClusterResources(ctx, testKey(), testManagementClusterResourceID,
+				buildClusterResources(map[string]string{"node-pool": nodePoolCR}))
+			require.NoError(t, err, "seeding the NodePool ApplyDesire should succeed")
 			_, err = npCRUD.Get(ctx, "nodepool")
 			require.NoError(t, err, "seed pass should have created the NodePool ApplyDesire")
 
 			// Cluster Service still reports the CR, as it does until it removes the
 			// ManifestWork.
-			require.NoError(t, syncer.processClusterResources(ctx, testKey(), testManagementClusterResourceID,
-				buildClusterResources(map[string]string{"node-pool": nodePoolCR})),
-				"processClusterResources should succeed")
+			err = syncer.processClusterResources(ctx, testKey(), testManagementClusterResourceID,
+				buildClusterResources(map[string]string{"node-pool": nodePoolCR}))
+			require.NoError(t, err, "processClusterResources should succeed")
 
 			desire, err := npCRUD.Get(ctx, "nodepool")
 			require.NoError(t, err, "NodePool ApplyDesire should still exist: %s", tt.reason)
@@ -1248,4 +1362,35 @@ func TestEnsureHostedClusterAnnotations(t *testing.T) {
 				"annotations should match expected")
 		})
 	}
+}
+
+// fixedKubeApplierDBClients returns one client for every management cluster.
+type fixedKubeApplierDBClients struct {
+	client kubeappliercosmosstorage.KubeApplierDBClient
+}
+
+func (f fixedKubeApplierDBClients) For(context.Context, *azcorearm.ResourceID) kubeappliercosmosstorage.KubeApplierDBClient {
+	return f.client
+}
+
+// preconditionOnReplaceClient serves the embedded client's ApplyDesire CRUD,
+// except Replace returns HTTP 412.
+type preconditionOnReplaceClient struct {
+	kubeappliercosmosstorage.KubeApplierDBClient
+}
+
+func (c preconditionOnReplaceClient) ApplyDesiresFor(parent kubeappliercosmosstorage.DesireScope) (cosmosstorageutils.ResourceCRUD[kubeapplierapi.ApplyDesire, *kubeapplierapi.ApplyDesire], error) {
+	crud, err := c.KubeApplierDBClient.ApplyDesiresFor(parent)
+	if err != nil {
+		return nil, err
+	}
+	return preconditionOnReplaceCRUD{ResourceCRUD: crud}, nil
+}
+
+type preconditionOnReplaceCRUD struct {
+	cosmosstorageutils.ResourceCRUD[kubeapplierapi.ApplyDesire, *kubeapplierapi.ApplyDesire]
+}
+
+func (c preconditionOnReplaceCRUD) Replace(context.Context, *kubeapplierapi.ApplyDesire, *azcosmos.ItemOptions) (*kubeapplierapi.ApplyDesire, error) {
+	return nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed}
 }

@@ -127,6 +127,13 @@ func (p DesireParent) readDesireCRUD(client kubeappliercosmosstorage.KubeApplier
 	return client.ReadDesiresFor(scope)
 }
 
+// IsConflictOrPreconditionFailedError reports whether err is an HTTP 409 Conflict
+// or an HTTP 412 Precondition Failed. Callers that want to ignore
+// a lost create or replace can treat a true result as success.
+func IsConflictOrPreconditionFailedError(err error) bool {
+	return cosmosstorageutils.IsConflictError(err) || cosmosstorageutils.IsPreconditionFailedError(err)
+}
+
 // EnsureApplyDesire creates desire, or replaces the stored one when its spec or
 // tags have drifted. It consults the ApplyDesire lister first — keyed by the desire's own
 // resource ID — so an already-correct desire is never rewritten, and logs
@@ -153,11 +160,7 @@ func EnsureApplyDesire(
 	case err != nil && !cosmosstorageutils.IsNotFoundError(err):
 		return utils.TrackError(fmt.Errorf("get ApplyDesire %s from lister: %w", desireName, err))
 	case existing == nil:
-		_, err := crud.Create(ctx, desire, nil)
-		switch {
-		case cosmosstorageutils.IsConflictError(err):
-			return nil
-		case err != nil:
+		if _, err := crud.Create(ctx, desire, nil); err != nil {
 			return utils.TrackError(fmt.Errorf("create ApplyDesire %s: %w", desireName, err))
 		}
 		logger.Info("created ApplyDesire", "desire", desireName, "targetResource", target.Resource, "targetName", target.Name)
@@ -167,11 +170,7 @@ func EnsureApplyDesire(
 		replacement.Spec = desire.Spec
 		replacement.Tags = desire.Tags
 		replacement.Status = kubeapplierapi.ApplyDesireStatus{}
-		_, err := crud.Replace(ctx, replacement, nil)
-		switch {
-		case cosmosstorageutils.IsPreconditionFailedError(err):
-			return nil
-		case err != nil:
+		if _, err := crud.Replace(ctx, replacement, nil); err != nil {
 			return utils.TrackError(fmt.Errorf("replace ApplyDesire %s: %w", desireName, err))
 		}
 		logger.Info("replaced ApplyDesire", "desire", desireName, "targetResource", target.Resource, "targetName", target.Name)
@@ -205,11 +204,7 @@ func EnsureReadDesire(
 	case err != nil && !cosmosstorageutils.IsNotFoundError(err):
 		return utils.TrackError(fmt.Errorf("get ReadDesire %s from lister: %w", desireName, err))
 	case existing == nil:
-		_, err := crud.Create(ctx, desire, nil)
-		switch {
-		case cosmosstorageutils.IsConflictError(err):
-			return nil
-		case err != nil:
+		if _, err := crud.Create(ctx, desire, nil); err != nil {
 			return utils.TrackError(fmt.Errorf("create ReadDesire %s: %w", desireName, err))
 		}
 		logger.Info("created ReadDesire", "desire", desireName, "targetResource", target.Resource, "targetName", target.Name)
@@ -219,11 +214,7 @@ func EnsureReadDesire(
 		replacement.Spec = desire.Spec
 		replacement.Tags = desire.Tags
 		replacement.Status = kubeapplierapi.ReadDesireStatus{}
-		_, err := crud.Replace(ctx, replacement, nil)
-		switch {
-		case cosmosstorageutils.IsPreconditionFailedError(err):
-			return nil
-		case err != nil:
+		if _, err := crud.Replace(ctx, replacement, nil); err != nil {
 			return utils.TrackError(fmt.Errorf("replace ReadDesire %s: %w", desireName, err))
 		}
 		logger.Info("replaced ReadDesire", "desire", desireName, "targetResource", target.Resource, "targetName", target.Name)

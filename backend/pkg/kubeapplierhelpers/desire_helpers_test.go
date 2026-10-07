@@ -16,6 +16,8 @@ package kubeapplierhelpers
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -28,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/json"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 
 	"github.com/Azure/ARO-HCP/internal/api/coreapi"
@@ -35,6 +38,7 @@ import (
 	"github.com/Azure/ARO-HCP/internal/api/kubeapplierapi"
 	"github.com/Azure/ARO-HCP/internal/api/metadataapi"
 	"github.com/Azure/ARO-HCP/internal/apihelpers/kubeapplierapihelpers"
+	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/cosmosstorageutils"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstoragetesting/kubeappliercosmosstoragetesting"
 	"github.com/Azure/ARO-HCP/internal/database/listertesting/fleetlistertesting"
 	"github.com/Azure/ARO-HCP/internal/database/listertesting/kubeapplierlistertesting"
@@ -216,6 +220,47 @@ func TestEnsureApplyDesireTagsDrift(t *testing.T) {
 	assert.Empty(t, got.Status.Conditions, "status should be cleared on replace triggered by tags drift")
 }
 
+func TestEnsureApplyDesireSurfacesConflictAndPreconditionErrors(t *testing.T) {
+	ctx := utils.ContextWithLogger(context.Background(), testr.New(t))
+	desireName := "test-apply-desire-errors"
+
+	t.Run("create conflict", func(t *testing.T) {
+		existing := buildTestApplyDesire(t, desireName, testCSR(t))
+		mockDB, _, _ := newMockDBAndListers(ctx, t, []any{existing})
+		crud, err := mockDB.ApplyDesiresForSystemAdminCredentialRequest(testSubscriptionID, testResourceGroupName, testClusterName, testCredentialName)
+		require.NoError(t, err)
+
+		// The lister has not observed the stored desire, so Ensure attempts Create
+		// and loses the race.
+		err = EnsureApplyDesire(ctx, crud, &kubeapplierlistertesting.SliceApplyDesireLister{}, buildTestApplyDesire(t, desireName, testCSR(t)))
+		require.Error(t, err)
+		assert.True(t, IsConflictOrPreconditionFailedError(err), "create conflict must be recognizable through the combined helper")
+		assert.True(t, cosmosstorageutils.IsConflictError(err), "create conflict must be returned to the caller")
+	})
+
+	t.Run("replace precondition failed", func(t *testing.T) {
+		existing := buildTestApplyDesire(t, desireName, testCSR(t))
+		mockDB, _, _ := newMockDBAndListers(ctx, t, []any{existing})
+		crud, err := mockDB.ApplyDesiresForSystemAdminCredentialRequest(testSubscriptionID, testResourceGroupName, testClusterName, testCredentialName)
+		require.NoError(t, err)
+
+		stored, err := crud.Get(ctx, desireName)
+		require.NoError(t, err)
+		stale := stored.DeepCopy()
+		stale.CosmosETag = "stale-etag"
+
+		desired := buildTestApplyDesire(t, desireName, testCSR(t))
+		desired.Tags = map[string]string{kubeapplierapi.TagControllerName: testControllerName, "owner": "new"}
+
+		err = EnsureApplyDesire(ctx, crud, &kubeapplierlistertesting.SliceApplyDesireLister{
+			Desires: []*kubeapplierapi.ApplyDesire{stale},
+		}, desired)
+		require.Error(t, err)
+		assert.True(t, IsConflictOrPreconditionFailedError(err), "replace precondition failure must be recognizable through the combined helper")
+		assert.True(t, cosmosstorageutils.IsPreconditionFailedError(err), "replace precondition failure must be returned to the caller")
+	})
+}
+
 func TestEnsureReadDesire(t *testing.T) {
 	desireName := "test-read-desire"
 	target := testTarget()
@@ -346,6 +391,62 @@ func TestEnsureReadDesireTagsDrift(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, desire.Tags, got.Tags, "tags drift must be persisted onto the stored desire")
 	assert.Empty(t, got.Status.Conditions, "status should be cleared on replace triggered by tags drift")
+}
+
+func TestEnsureReadDesireSurfacesConflictAndPreconditionErrors(t *testing.T) {
+	ctx := utils.ContextWithLogger(context.Background(), testr.New(t))
+	desireName := "test-read-desire-errors"
+	target := testTarget()
+
+	t.Run("create conflict", func(t *testing.T) {
+		existing := buildTestReadDesire(t, desireName, target)
+		mockDB, _, _ := newMockDBAndListers(ctx, t, []any{existing})
+		crud, err := mockDB.ReadDesiresForSystemAdminCredentialRequest(testSubscriptionID, testResourceGroupName, testClusterName, testCredentialName)
+		require.NoError(t, err)
+
+		// The lister has not observed the stored desire, so Ensure attempts Create
+		// and loses the race.
+		err = EnsureReadDesire(ctx, crud, &kubeapplierlistertesting.SliceReadDesireLister{}, buildTestReadDesire(t, desireName, target))
+		require.Error(t, err)
+		assert.True(t, IsConflictOrPreconditionFailedError(err), "create conflict must be recognizable through the combined helper")
+		assert.True(t, cosmosstorageutils.IsConflictError(err), "create conflict must be returned to the caller")
+	})
+
+	t.Run("replace precondition failed", func(t *testing.T) {
+		existing := buildTestReadDesire(t, desireName, target)
+		mockDB, _, _ := newMockDBAndListers(ctx, t, []any{existing})
+		crud, err := mockDB.ReadDesiresForSystemAdminCredentialRequest(testSubscriptionID, testResourceGroupName, testClusterName, testCredentialName)
+		require.NoError(t, err)
+
+		stored, err := crud.Get(ctx, desireName)
+		require.NoError(t, err)
+		stale := stored.DeepCopy()
+		stale.CosmosETag = "stale-etag"
+
+		desired := buildTestReadDesire(t, desireName, target)
+		desired.Tags = map[string]string{kubeapplierapi.TagControllerName: testControllerName, "owner": "new"}
+
+		err = EnsureReadDesire(ctx, crud, &kubeapplierlistertesting.SliceReadDesireLister{
+			Desires: []*kubeapplierapi.ReadDesire{stale},
+		}, desired)
+		require.Error(t, err)
+		assert.True(t, IsConflictOrPreconditionFailedError(err), "replace precondition failure must be recognizable through the combined helper")
+		assert.True(t, cosmosstorageutils.IsPreconditionFailedError(err), "replace precondition failure must be returned to the caller")
+	})
+}
+
+func TestIsConflictOrPreconditionFailedError(t *testing.T) {
+	conflict := &azcore.ResponseError{StatusCode: http.StatusConflict}
+	precondition := &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed}
+
+	assert.True(t, IsConflictOrPreconditionFailedError(conflict), "a bare conflict is one of the ignorable write errors")
+	assert.True(t, IsConflictOrPreconditionFailedError(precondition), "a bare precondition failure is one of the ignorable write errors")
+	assert.True(t, IsConflictOrPreconditionFailedError(utils.TrackError(fmt.Errorf("create ApplyDesire: %w", conflict))), "a wrapped conflict stays recognizable")
+	assert.True(t, IsConflictOrPreconditionFailedError(utils.TrackError(fmt.Errorf("replace ReadDesire: %w", precondition))), "a wrapped precondition failure stays recognizable")
+
+	assert.False(t, IsConflictOrPreconditionFailedError(nil), "nil stays false")
+	assert.False(t, IsConflictOrPreconditionFailedError(fmt.Errorf("boom")), "an unrelated error stays false")
+	assert.False(t, IsConflictOrPreconditionFailedError(cosmosstorageutils.NewNotFoundError()), "not found stays false")
 }
 
 // buildTestApplyDesire constructs a credential-request-scoped ApplyDesire the way

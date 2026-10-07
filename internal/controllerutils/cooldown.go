@@ -94,13 +94,20 @@ func (c *TimeBasedCooldownChecker) CanSync(_ context.Context, key any) bool {
 // attempt, so a failed sync stays eligible to retry immediately. RecordSuccess
 // stamps the success time that later CanSync calls measure against.
 //
-// The success map is an LRU rather than an unbounded map so that a
-// long-running process whose keys come and go does not leak memory. 1M
-// entries is far above any realistic management cluster's resource count.
+// SkipCooldown tells the next RecordSuccess for that key not to stamp. A sync
+// that hits a lost write can still return success, then RecordSuccess, without
+// starting the interval. ClearSkipCooldown drops a skip that should not
+// survive, such as when that same sync also returns an error and never calls
+// RecordSuccess.
+//
+// The maps are LRUs rather than unbounded maps so that a long-running process
+// whose keys come and go does not leak memory. 1M entries is far above any
+// realistic management cluster's resource count.
 type LastSuccessCooldownChecker struct {
 	clock            utilsclock.PassiveClock
 	cooldownDuration time.Duration
 	lastSuccessTime  *lru.Cache
+	skipNextSuccess  *lru.Cache
 }
 
 // NewLastSuccessCooldownChecker constructs a checker bound to the real
@@ -111,6 +118,7 @@ func NewLastSuccessCooldownChecker(cooldownDuration time.Duration) *LastSuccessC
 		clock:            utilsclock.RealClock{},
 		cooldownDuration: cooldownDuration,
 		lastSuccessTime:  lru.New(1000000),
+		skipNextSuccess:  lru.New(1000000),
 	}
 }
 
@@ -132,9 +140,28 @@ func (c *LastSuccessCooldownChecker) CanSync(_ context.Context, key any) bool {
 	return c.clock.Now().After(lastSuccess.(time.Time).Add(c.cooldownDuration))
 }
 
+// SkipCooldown marks key so the next RecordSuccess does not stamp a success
+// time. The mark is consumed by that RecordSuccess, or by ClearSkipCooldown.
+func (c *LastSuccessCooldownChecker) SkipCooldown(key any) {
+	c.skipNextSuccess.Add(key, struct{}{})
+}
+
+// ClearSkipCooldown drops a skip requested for key. Call it when the sync that
+// requested the skip returns an error instead of RecordSuccess, so the next
+// successful sync still starts the cooldown.
+func (c *LastSuccessCooldownChecker) ClearSkipCooldown(key any) {
+	c.skipNextSuccess.Remove(key)
+}
+
 // RecordSuccess stamps the key's last success time to now. Later CanSync
 // calls return false until cooldownDuration has elapsed after this time.
+// A skip requested for key since the previous RecordSuccess is consumed
+// instead, and no success time is stamped.
 func (c *LastSuccessCooldownChecker) RecordSuccess(key any) {
+	if _, skip := c.skipNextSuccess.Get(key); skip {
+		c.skipNextSuccess.Remove(key)
+		return
+	}
 	c.lastSuccessTime.Add(key, c.clock.Now())
 }
 

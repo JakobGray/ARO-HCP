@@ -108,6 +108,44 @@ func TestLastSuccessCooldownChecker_SuccessStartsCooldown(t *testing.T) {
 	}
 }
 
+func TestLastSuccessCooldownChecker_SkipCooldownSuppressesNextSuccess(t *testing.T) {
+	startTime := time.Now()
+	fakeClock := clocktesting.NewFakePassiveClock(startTime)
+	checker := NewLastSuccessCooldownChecker(10 * time.Second)
+	checker.SetClock(fakeClock)
+
+	ctx := context.Background()
+	key := "test-key"
+
+	checker.SkipCooldown(key)
+	checker.RecordSuccess(key)
+	if !checker.CanSync(ctx, key) {
+		t.Fatal("expected a skipped success not to start the cooldown")
+	}
+
+	checker.RecordSuccess(key)
+	if checker.CanSync(ctx, key) {
+		t.Fatal("expected the following success to start the cooldown")
+	}
+}
+
+func TestLastSuccessCooldownChecker_ClearSkipCooldownAllowsNextSuccess(t *testing.T) {
+	startTime := time.Now()
+	fakeClock := clocktesting.NewFakePassiveClock(startTime)
+	checker := NewLastSuccessCooldownChecker(10 * time.Second)
+	checker.SetClock(fakeClock)
+
+	ctx := context.Background()
+	key := "test-key"
+
+	checker.SkipCooldown(key)
+	checker.ClearSkipCooldown(key)
+	checker.RecordSuccess(key)
+	if checker.CanSync(ctx, key) {
+		t.Fatal("expected a cleared skip to let RecordSuccess start the cooldown")
+	}
+}
+
 func TestSettableCooldownChecker_NoKeyAlwaysAllowed(t *testing.T) {
 	checker := NewSettableCooldownChecker()
 	ctx := context.Background()

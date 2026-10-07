@@ -64,7 +64,7 @@ func DeleteAllChildDesires(
 	for _, desire := range applyIter.Items(ctx) {
 		desireName := desire.ResourceID.Name
 		removed, err := EnsureApplyDesireRemoved(ctx, desireName, applyCRUD)
-		if err != nil {
+		if err != nil && !cosmosstorageutils.IsPreconditionFailedError(err) {
 			errs = append(errs, utils.TrackError(err))
 			continue
 		}
@@ -133,11 +133,9 @@ func EnsureApplyDesireRemoved(
 		// kube-applier, Successful) unambiguously reflects the delete rather than a
 		// stale server-side-apply result.
 		applyDesire.Status.Conditions = nil
-		// A NotFound (the desire was deleted concurrently) or a PreconditionFailed
-		// (a concurrent kube-applier status update bumped the etag) is a benign
-		// race — the next reconcile retries.
+		// A NotFound means the desire was deleted concurrently; removed stays false so they retry.
 		if _, err := applyCRUD.Replace(ctx, applyDesire, nil); err != nil {
-			if cosmosstorageutils.IsNotFoundError(err) || cosmosstorageutils.IsPreconditionFailedError(err) {
+			if cosmosstorageutils.IsNotFoundError(err) {
 				return false, nil
 			}
 			return false, utils.TrackError(fmt.Errorf("convert ApplyDesire %s to Delete: %w", desireName, err))

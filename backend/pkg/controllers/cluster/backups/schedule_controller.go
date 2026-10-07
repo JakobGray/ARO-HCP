@@ -251,7 +251,9 @@ func (c *backupScheduleSyncer) syncDeletion(ctx context.Context, key controlleru
 			continue
 		}
 		if _, err := kubeapplierhelpers.EnsureApplyDesireRemoved(ctx, applyDesire.ResourceID.Name, applyDesireCRUD); err != nil {
-			return err
+			if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+				return err
+			}
 		}
 		return nil
 	}
@@ -305,12 +307,16 @@ func (c *backupScheduleSyncer) createOrUpdateDesires(
 	// schedule's status is observed as soon as its ApplyDesire lands.
 	for _, readDesire := range readDesires {
 		if err := kubeapplierhelpers.EnsureReadDesire(ctx, readDesireCRUD, c.readDesireLister, readDesire); err != nil {
-			return err
+			if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+				return err
+			}
 		}
 	}
 	for _, applyDesire := range applyDesires {
 		if err := kubeapplierhelpers.EnsureApplyDesire(ctx, applyDesireCRUD, c.applyDesireLister, applyDesire); err != nil {
-			return err
+			if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+				return err
+			}
 		}
 	}
 	return nil
@@ -335,7 +341,9 @@ func (c *backupScheduleSyncer) deleteStaleApplyDesires(
 		}
 		removed, err := kubeapplierhelpers.EnsureApplyDesireRemoved(ctx, applyDesire.ResourceID.Name, applyDesireCRUD)
 		if err != nil {
-			return false, err
+			if !kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+				return false, err
+			}
 		}
 		if removed {
 			return true, nil

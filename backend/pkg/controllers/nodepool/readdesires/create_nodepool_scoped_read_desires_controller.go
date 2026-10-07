@@ -162,7 +162,13 @@ func (c *createNodePoolScopedReadDesiresSyncer) SyncOnce(ctx context.Context, ke
 	if err != nil {
 		return err
 	}
-	return kubeapplierhelpers.EnsureReadDesire(ctx, crud, c.readDesireLister, readDesire)
+	if err := kubeapplierhelpers.EnsureReadDesire(ctx, crud, c.readDesireLister, readDesire); err != nil {
+		if kubeapplierhelpers.IsConflictOrPreconditionFailedError(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // buildNodePoolReadDesire builds a node-pool-scoped ReadDesire that observes
